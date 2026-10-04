@@ -1,223 +1,274 @@
+-- Discord Leorizoto Roblox Leorizoto
+
 local PhysicsService = game:GetService("PhysicsService")
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
-local ServerStorage = game:GetService("ServerStorage")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local TweenService = game:GetService("TweenService")
 
--- shared state keeps the spawner and the other round modules on the same data
-local S = require(script.Parent.GameState)
-local EM = require(script.Parent.EffectManager)
-local OH = require(script.Parent.OrderHelper)
 local CT = require(script.Parent.ClientTypes)
+local EM = require(script.Parent.EffectManager)
+local S = require(script.Parent.GameState)
+local OH = require(script.Parent.OrderHelper)
 local ItemsModule = require(ReplicatedStorage:WaitForChild("Configs"):WaitForChild("ItemsData"))
 
+local GREEN = Color3.fromRGB(41, 255, 17)
+local ORANGE = Color3.fromRGB(255, 162, 0)
+local RED = Color3.fromRGB(200, 0, 0)
+local BAR_TWEEN = TweenInfo.new(0.1, Enum.EasingStyle.Linear)
+local WALK_ANIMATION = 913402848
+local SPECIAL_WALK_ANIMATION = 10921152678
+
 local PS = {}
+local customers = {}
+local movements = {}
+local collisionReady = false
 
-local green = Color3.fromRGB(41, 255, 17)
-local orange = Color3.fromRGB(255, 162, 0)
-local red = Color3.fromRGB(200, 0, 0)
-
-local function lerpColor(c1, c2, t)
-	-- each channel moves a fraction t of the distance from the first color to the second
-	return Color3.new(c1.R+(c2.R-c1.R)*t, c1.G+(c2.G-c1.G)*t, c1.B+(c2.B-c1.B)*t)
+local function roundIsRunning(roundNumber)
+	return S.isRoundRunning and not S.stopCurrentSpawn
+		and S.lives > 0 and S.roundNumber == roundNumber
 end
 
--- split the range at halfway so the bar goes from green to orange then red
+local function customerIsActive(pnj)
+	return pnj.Parent ~= nil and not pnj:GetAttribute("Finalized")
+end
+
 local function getPatienceColor(ratio)
-	if ratio > 0.5 then return lerpColor(orange, green, (ratio-0.5)/0.5)
-	else return lerpColor(red, orange, ratio/0.5) end
+	-- each half uses the same zero to one range for the color blend
+	if ratio > 0.5 then
+		return ORANGE:Lerp(GREEN, (ratio - 0.5) * 2)
+	end
+	return RED:Lerp(ORANGE, ratio * 2)
 end
 
--- smooth the bar between patience updates instead of snapping its width
-local function updatePatienceBar(fill, ratio)
-	TweenService:Create(fill, TweenInfo.new(0.1, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), {
-		Size = UDim2.new(ratio, 0, 0.7, 0)
-	}):Play()
-end
-
-local function freeSpot(occupiedTable, spotName, folder)
-	if not spotName or not folder then return end
-	local spot = folder:FindFirstChild(spotName)
-	-- the table uses the part itself as a key
-	-- assigning nil removes the reservation instead of keeping a false entry
-	if spot then occupiedTable[spot] = nil end
-end
-
--- reserve the chosen spot before returning so another customer cannot take it
-local function getFreeSpot(folder, occupiedTable)
+local function getFreeSpot(folder, occupied)
 	local free = {}
-	for _, spot in ipairs(folder:GetChildren()) do
-		if spot:IsA("BasePart") and not occupiedTable[spot] then
+	for _, spot in folder:GetChildren() do
+		if spot:IsA("BasePart") and not occupied[spot] then
 			table.insert(free, spot)
 		end
 	end
-	if #free > 0 then
-		local chosen = free[math.random(1, #free)]
-		-- there is no yield between checking and reserving the spot
-		-- another spawn using this same table cannot run in the middle of this step
-		occupiedTable[chosen] = true
-		return chosen
+	if #free == 0 then
+		return nil
 	end
-	return nil
+
+	-- checking and claiming happen without a yield so spawns cannot share a spot
+	local spot = free[math.random(1, #free)]
+	occupied[spot] = true
+	return spot
 end
 
--- tickets limit how many customers can enter the serving area
-local function releaseTicket()
-	if S.arrivalTicketsInUse > 0 then
-		S.arrivalTicketsInUse = math.max(0, S.arrivalTicketsInUse - 1)
+local function freeSpot(pnj, attribute, folderName, occupied)
+	local name = pnj:GetAttribute(attribute)
+	if not name then
+		return
 	end
+	local folder = workspace:FindFirstChild(folderName)
+	local spot = folder and folder:FindFirstChild(name)
+	if spot then
+		occupied[spot] = nil
+	end
+	-- clear ownership too so later cleanup cannot release a spot reused by another customer
+	pnj:SetAttribute(attribute, nil)
 end
 
--- customers can pass through each other but still collide with the map
+local function releaseTicket(pnj)
+	if not pnj:GetAttribute("HasArrivalTicket") then
+		return
+	end
+	pnj:SetAttribute("HasArrivalTicket", nil)
+	S.arrivalTicketsInUse = math.max(0, S.arrivalTicketsInUse - 1)
+end
+
 local function ensureCollision()
-	pcall(function()
-		local groups = PhysicsService:GetRegisteredCollisionGroups()
-		local has = false
-		for _, g in ipairs(groups) do
-			if g.name == "PNJ" or g.Name == "PNJ" then
-				has = true
-				break
-			end
+	if collisionReady then
+		return
+	end
+	if not PhysicsService:IsCollisionGroupRegistered("PNJ") then
+		PhysicsService:RegisterCollisionGroup("PNJ")
+	end
+	PhysicsService:CollisionGroupSetCollidable("PNJ", "PNJ", false)
+	PhysicsService:CollisionGroupSetCollidable("PNJ", "Default", true)
+	collisionReady = true
+end
+
+local function preparePhysics(pnj)
+	ensureCollision()
+	for _, part in pnj:GetDescendants() do
+		if not part:IsA("BasePart") then
+			continue
 		end
-		if not has then PhysicsService:RegisterCollisionGroup("PNJ") end
-		-- the collision matrix applies this rule to every part in the PNJ group
-		PhysicsService:CollisionGroupSetCollidable("PNJ", "PNJ", false)
-		PhysicsService:CollisionGroupSetCollidable("PNJ", "Default", true)
+		part.CollisionGroup = "PNJ"
+		if part.Name == "Handle" and part.Parent:IsA("Accessory") then
+			part.CanCollide = false
+			part.Massless = true
+			part.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0.3, 0.5, 1, 1)
+		end
+	end
+end
+
+local function pivotRootTo(pnj, root, target)
+	-- the model pivot can differ from the root so preserve their relative offset
+	local rootToPivot = root.CFrame:ToObjectSpace(pnj:GetPivot())
+	pnj:PivotTo(target * rootToPivot)
+end
+
+local function placeOnSpot(pnj, spot, offset)
+	local humanoid = pnj:FindFirstChildOfClass("Humanoid")
+	local root = pnj:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root or not spot then
+		return
+	end
+	local position = spot.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y * 0.5 + offset, 0)
+	pivotRootTo(pnj, root, CFrame.lookAt(position, position + spot.CFrame.LookVector))
+end
+
+local function stopTrack(track)
+	if not track then
+		return
+	end
+	track:Stop()
+	track:Destroy()
+end
+
+local function loadTrack(humanoid, animationId)
+	local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		return nil
+	end
+	local animation = Instance.new("Animation")
+	animation.AnimationId = "rbxassetid://" .. tostring(animationId)
+	local ok, track = pcall(function()
+		return animator:LoadAnimation(animation)
 	end)
-end
-
--- avatar accessories should not push the customer around or add weight
-local function sanitize(model)
-	for _, acc in ipairs(model:GetDescendants()) do
-		if acc:IsA("Accessory") then
-			local h = acc:FindFirstChild("Handle")
-			if h and h:IsA("BasePart") then
-				h.CanCollide = false
-				h.Massless = true
-				h.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0.3, 0.5, 1, 1)
-			end
-		end
+	-- the track keeps the loaded animation so the temporary instance can be removed
+	animation:Destroy()
+	if not ok then
+		warn("PNJ animation could not load", track)
+		return nil
 	end
+	return track
 end
 
-local function setCollisionGroup(pnj)
-	for _, p in ipairs(pnj:GetDescendants()) do
-		if p:IsA("BasePart") then p.CollisionGroup = "PNJ" end
+local function cancelMovement(humanoid)
+	local movement = movements[humanoid]
+	if not movement then
+		return
 	end
+	movements[humanoid] = nil
+	movement.connection:Disconnect()
+	stopTrack(movement.track)
 end
 
-local function placeOnSpot(model, spot)
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	local hrp = model:FindFirstChild("HumanoidRootPart")
-	if not hum or not hrp or not spot then return end
-	-- keep the customer physics on the server
-	-- nil assigns the assembly to the server instead of letting a nearby client simulate it
-	hrp:SetNetworkOwner(nil)
-	hrp.CanCollide = true
-	-- offset the root by the rig height so the feet sit above the spot
-	local y = spot.Position.Y + hum.HipHeight + (hrp.Size.Y * 0.5)
-	-- the spot orientation supplies the forward direction
-	-- adding that vector to the root position gives the point for the rig to face
-	local look = spot.CFrame.LookVector
-	hrp.CFrame = CFrame.new(
-		Vector3.new(spot.Position.X, y+0.05, spot.Position.Z),
-		Vector3.new(spot.Position.X, y+0.05, spot.Position.Z) + look
-	)
-end
-
--- use a timeout so a blocked customer cannot hold this call forever
-local function moveTo(humanoid, targetPos, id, timeout)
-	if not humanoid or not humanoid.Parent then return false end
-	timeout = timeout or 6
+local function moveTo(humanoid, position, animationId, timeout, canContinue)
+	if not humanoid or not humanoid.Parent then
+		return false
+	end
+	local model = humanoid.Parent
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+	cancelMovement(humanoid)
+	local track = loadTrack(humanoid, animationId)
 	local reached = false
-	local anim = Instance.new("Animation")
-	anim.AnimationId = "rbxassetid://" .. id
-	local track = humanoid.Animator:LoadAnimation(anim)
-	local conn
-	local faceConn
-	conn = humanoid.MoveToFinished:Connect(function(r)
-		track:Stop()
-		if r then reached = true end
-		if conn then conn:Disconnect() end
-		if faceConn then faceConn:Disconnect() end
+	local finished = false
+	-- one connection handles the result so separate callbacks cannot cancel each other
+	local connection = humanoid.MoveToFinished:Connect(function(success)
+		reached = success
+		finished = true
 	end)
-	-- use the root height when building the direction so the turn stays horizontal
-	faceConn = humanoid.MoveToFinished:Connect(function()
-		local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
-		if root then
-			local delta = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z) - root.Position
-			-- avoid normalizing a near zero vector before using it as a facing direction
-			if delta.Magnitude > 0.05 then
-				root.CFrame = CFrame.lookAt(root.Position, root.Position + delta.Unit)
-			end
+	local movement = { connection = connection, track = track }
+	movements[humanoid] = movement
+	humanoid:MoveTo(position)
+	if track then
+		track:Play()
+	end
+	local deadline = os.clock() + timeout
+	while model.Parent and movements[humanoid] == movement and not finished and os.clock() < deadline do
+		if canContinue and not canContinue() then
+			break
 		end
-	end)
-	humanoid:MoveTo(targetPos)
-	track:Play()
-	local t = tick()
-	while not reached and tick()-t < timeout do
-		if not humanoid.Parent then break end
-		local root = humanoid.Parent:FindFirstChild("HumanoidRootPart")
-		-- allow a small distance margin when the customer is already close enough
-		if root and (root.Position - targetPos).Magnitude <= 2 then reached = true track:Stop() break end
+		if (root.Position - position).Magnitude <= 2 then
+			reached = true
+			break
+		end
 		task.wait(0.1)
 	end
-	-- disconnect after the wait too because the timeout may finish before the event
-	if conn then conn:Disconnect() end
-	if faceConn then faceConn:Disconnect() end
+	-- an older movement must not stop the exit walk that replaced it
+	if movements[humanoid] ~= movement then
+		return false
+	end
+	cancelMovement(humanoid)
+	-- stop the move command as well when the wait was cancelled or timed out
+	if model.Parent and not reached then
+		humanoid:MoveTo(root.Position)
+	end
 	return reached
 end
 
--- reuse the friend pool only after all available friends have been picked
 local function applyFriendSkin(pnj)
-	-- next returns nil for an empty table so this checks whether the current pool is exhausted
-	if not next(S.friendPool) and next(S.usedFriends) then
-		for id in pairs(S.usedFriends) do S.friendPool[id] = true end
-		S.usedFriends = {}
+	local humanoid = pnj:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
 	end
-	-- friend ids are dictionary keys so build an array for a random numeric index
-	local keys = {}
-	for k in pairs(S.friendPool) do table.insert(keys, k) end
-	if #keys == 0 then return end
-	local friendId = keys[math.random(1, #keys)]
-	-- move the selected id to the used set so it cannot be picked again during this cycle
-	S.friendPool[friendId] = nil
-	S.usedFriends[friendId] = true
-	local humanoid = pnj:FindFirstChildWhichIsA("Humanoid")
-	if not humanoid then return end
-	-- a failed avatar lookup should not stop the spawn
-	local ok, desc = pcall(function()
-		return Players:GetHumanoidDescriptionFromUserId(friendId)
+	if not next(S.friendPool) and next(S.usedFriends) then
+		for id in S.usedFriends do
+			S.friendPool[id] = true
+		end
+		table.clear(S.usedFriends)
+	end
+	local ids = {}
+	for id in S.friendPool do
+		table.insert(ids, id)
+	end
+	if #ids == 0 then
+		return
+	end
+	local id = ids[math.random(1, #ids)]
+	S.friendPool[id] = nil
+	S.usedFriends[id] = true
+	local description
+	-- both avatar operations can yield or fail so protect the whole request
+	local ok, err = pcall(function()
+		description = Players:GetHumanoidDescriptionFromUserIdAsync(id)
+		if customerIsActive(pnj) then
+			humanoid:ApplyDescriptionAsync(description)
+		end
 	end)
-	if ok and desc then humanoid:ApplyDescription(desc) end
+	if description then
+		description:Destroy()
+	end
+	if not ok then
+		warn("PNJ appearance could not load", err)
+	end
 end
 
--- use the customer type colors for the background and borders
+local function colorFrame(frame, colors)
+	if not frame then
+		return
+	end
+	frame.BackgroundColor3 = colors.main
+	local stroke = frame:FindFirstChildOfClass("UIStroke")
+	if stroke then
+		stroke.Color = colors.stroke
+	end
+end
+
 local function applyTypeToBillboard(frame, clientType)
 	local colors = S.TYPE_COLORS[clientType]
-	if not colors or not frame then return end
-
-	-- remove the old gradient so it does not tint the new customer type colors
-	local existing = frame:FindFirstChildOfClass("UIGradient")
-	if existing then existing:Destroy() end
-
-	frame.BackgroundColor3 = colors.main
-
-	local s = frame:FindFirstChildOfClass("UIStroke")
-	if s then s.Color = colors.stroke end
-
-	local fi = frame:FindFirstChild("Frame")
-	if fi then fi.BackgroundColor3 = colors.main end
-
-	local f1 = frame:FindFirstChild("Frame1")
-	if f1 then
-		f1.BackgroundColor3 = colors.main
-		local s1 = f1:FindFirstChildOfClass("UIStroke")
-		if s1 then s1.Color = colors.stroke end
+	if not colors then
+		return
 	end
+	local gradient = frame:FindFirstChildOfClass("UIGradient")
+	if gradient then
+		gradient:Destroy()
+	end
+	colorFrame(frame, colors)
+	colorFrame(frame:FindFirstChild("Frame"), colors)
+	colorFrame(frame:FindFirstChild("Frame1"), colors)
 end
 
--- carried food is visual and should not affect movement or hit detection
 local function prepCarryPart(part)
 	part.Anchored = false
 	part.CanCollide = false
@@ -288,444 +339,500 @@ local function makeCarryTool(itemName)
 	return tool
 end
 
--- only attach one carried item even if this is called again
+
 function PS.attachServedItem(pnj, itemName)
-	if not pnj or not pnj.Parent or pnj:FindFirstChild("ServedCarryItem") then return end
-	if not itemName or itemName == "" then return end
-
-	local humanoid = pnj:FindFirstChildWhichIsA("Humanoid")
-	if not humanoid then return end
-
+	if not pnj or not customerIsActive(pnj) or pnj:FindFirstChild("ServedCarryItem") then
+		return
+	end
+	if not itemName or itemName == "" then
+		return
+	end
+	local humanoid = pnj:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
 	local tool = makeCarryTool(itemName)
 	tool.Parent = pnj
 	humanoid:EquipTool(tool)
 end
 
-function PS.finalizePNJ(pnj, reason)
-	if not pnj or not pnj.Parent then return end
-	-- prevent repeated cleanup from releasing the same customer twice
-	if pnj:GetAttribute("Finalized") then return end
-	-- set the flag before the exit task starts so later calls see that cleanup already began
-	pnj:SetAttribute("Finalized", reason or "unknown")
-
-	local arriveFolder = workspace:FindFirstChild("ArrivePNJ")
-	local departFolder = workspace:FindFirstChild("DepartSpots")
-	freeSpot(S.occupiedArriveSpots, pnj:GetAttribute("AssignedSpot"), arriveFolder)
-	freeSpot(S.occupiedDepartSpots, pnj:GetAttribute("DepartSpot"), departFolder)
-
-	if pnj:GetAttribute("HasArrivalTicket") then
-		releaseTicket()
-		pnj:SetAttribute("HasArrivalTicket", nil)
+local function clearWarning(context)
+	stopTrack(context.warningTrack)
+	context.warningTrack = nil
+	if context.warningSound then
+		context.warningSound:Destroy()
+		context.warningSound = nil
 	end
+	if context.warningVFX then
+		context.warningVFX:Destroy()
+		context.warningVFX = nil
+	end
+	context.warningActive = false
+end
 
-	local head = pnj:FindFirstChild("Head")
-	local bb = head and head:FindFirstChildWhichIsA("BillboardGui")
-	if bb then bb.Enabled = false end
-
-	-- only remove the round count while the customer is still registered as active
+local function unregisterCustomer(pnj)
+	local context = customers[pnj]
+	customers[pnj] = nil
+	if context then
+		cancelMovement(context.humanoid)
+		clearWarning(context)
+		if context.barTween then
+			context.barTween:Cancel()
+			context.barTween:Destroy()
+		end
+		context.removalConnection:Disconnect()
+	end
+	freeSpot(pnj, "AssignedSpot", "ArrivePNJ", S.occupiedArriveSpots)
+	freeSpot(pnj, "DepartSpot", "DepartSpots", S.occupiedDepartSpots)
+	releaseTicket(pnj)
 	if S.activePNJ[pnj] then
 		S.activePNJ[pnj] = nil
 		S.aliveThisRound = math.max(0, S.aliveThisRound - 1)
 	end
+end
 
-	local humanoid = pnj:FindFirstChildWhichIsA("Humanoid")
-	local sortie = workspace:FindFirstChild("SortiePNJ")
-	local animId = pnj:GetAttribute("IsSpecialClient") and 10921152678 or 913402848
-
+function PS.finalizePNJ(pnj, reason)
+	if not pnj or not customerIsActive(pnj) then
+		return
+	end
+	-- mark the customer before yielding so timeout and serving cannot both finalize it
+	pnj:SetAttribute("Finalized", reason or "unknown")
+	local context = customers[pnj]
+	if context and context.billboard then
+		context.billboard.Enabled = false
+	end
+	unregisterCustomer(pnj)
+	local humanoid = pnj:FindFirstChildOfClass("Humanoid")
+	local exit = workspace:FindFirstChild("SortiePNJ")
+	local animationId = pnj:GetAttribute("IsSpecialClient") and SPECIAL_WALK_ANIMATION or WALK_ANIMATION
 	task.spawn(function()
-		-- the exit runs in a separate task so the caller does not wait for the walk to finish
-		moveTo(humanoid, sortie.Position, animId, 8)
+		if exit and exit:IsA("BasePart") then
+			moveTo(humanoid, exit.Position, animationId, 8)
+		end
 		task.wait(0.5)
-		if pnj.Parent then pnj:Destroy() end
+		pnj:Destroy()
 	end)
 end
 
-function PS.spawnPNJForRound(roundNum, opts)
-	local departFolder = workspace:WaitForChild("DepartSpots")
-	local arriveFolder = workspace:WaitForChild("ArrivePNJ")
-	local passagePart = workspace:WaitForChild("PassagePNJ")
-	opts = opts or {}
+local function registerCustomer(pnj, roundNumber)
+	local context = { roundNumber = roundNumber, warningActive = false }
+	customers[pnj] = context
+	S.activePNJ[pnj] = true
+	S.aliveThisRound += 1
+	-- register before avatar loading because that request can yield while the round ends
+	context.removalConnection = pnj.AncestryChanged:Connect(function(_, parent)
+		if parent == nil then
+			unregisterCustomer(pnj)
+		end
+	end)
+	return context
+end
 
-	if not S.isRoundRunning or S.stopCurrentSpawn or S.lives <= 0 then return nil end
-
-	-- wait for a spawn position while still allowing the round to stop
-	local departSpot
-	while not departSpot do
-		if not S.isRoundRunning or S.stopCurrentSpawn or S.lives <= 0 then return nil end
-		departSpot = getFreeSpot(departFolder, S.occupiedDepartSpots)
-		if not departSpot then task.wait(0.25) end
-	end
-
-	local clientType = opts.special and "special" or CT.pickClientType()
-
-	local pnj
-	if opts.special then
-		pnj = ServerStorage:WaitForChild("SpecialClientRig"):Clone()
-		pnj.Name = "VIP_R" .. roundNum
-	else
-		pnj = ServerStorage:WaitForChild("TemplatePNJ"):Clone()
-		pnj.Name = "PNJ_R" .. roundNum
-	end
-	pnj.Parent = workspace
-	pnj:SetAttribute("ClientType", clientType)
-
-	if clientType == "vacationer" then
-		S.vacationersRemaining = math.max(0, S.vacationersRemaining - 1)
-	end
-
-	if not opts.special then applyFriendSkin(pnj) end
-	if opts.special then
-		local snd = workspace:FindFirstChild("vip")
-		if snd then pcall(function() snd:Play() end) end
-	end
-
-	local anim = ServerStorage.Animate:Clone()
-	anim.Parent = pnj
-
-	ensureCollision()
-	sanitize(pnj)
-	setCollisionGroup(pnj)
-
-	if not pnj.PrimaryPart then
-		pnj.PrimaryPart = pnj:FindFirstChild("HumanoidRootPart") or pnj:FindFirstChildWhichIsA("BasePart")
-	end
-
-	local humanoid = pnj:FindFirstChildWhichIsA("Humanoid")
-	pnj.Humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-	placeOnSpot(pnj, departSpot)
-	pnj:SetAttribute("DepartSpot", departSpot.Name)
-
-	-- the expanded list tracks the full order and the counts group matching food items
-	local orderExpanded, orderCounts
-	if opts.special then
-		orderExpanded, orderCounts = OH.pickSpecialOrder()
+local function selectOrder(pnj, roundNumber, clientType, special)
+	if special then
 		pnj:SetAttribute("IsSpecialClient", true)
 		pnj:SetAttribute("RewardMultiplier", S.SPECIAL_REWARD_MULT)
-	elseif clientType == "inspector" then
-		orderExpanded, orderCounts = OH.pickInspectorOrder(roundNum)
-		pnj:SetAttribute("RewardMultiplier", 1 + math.floor(roundNum / 3) * 0.5)
-	elseif clientType == "mysterious" then
-		-- mysterious customers have no normal food order and are handled through their timeout
-		orderExpanded, orderCounts = {}, {}
-		pnj:SetAttribute("RewardMultiplier", 1)
-	elseif clientType == "vacationer" then
-		orderExpanded, orderCounts = OH.pickOrder(roundNum)
-		pnj:SetAttribute("RewardMultiplier", 2)
-	else
-		orderExpanded, orderCounts = OH.pickOrder(roundNum)
-		pnj:SetAttribute("RewardMultiplier", 1)
+		return OH.pickSpecialOrder()
 	end
+	if clientType == "inspector" then
+		pnj:SetAttribute("RewardMultiplier", 1 + math.floor(roundNumber / 3) * 0.5)
+		return OH.pickInspectorOrder(roundNumber)
+	end
+	pnj:SetAttribute("RewardMultiplier", clientType == "vacationer" and 2 or 1)
+	if clientType == "mysterious" then
+		return {}, {}
+	end
+	return OH.pickOrder(roundNumber)
+end
 
-	-- attributes let the serving logic and clients read the customer state
-	pnj:SetAttribute("OrderCount", #orderExpanded)
+local function configureOrder(pnj, roundNumber, clientType, special)
+	local expanded, counts = selectOrder(pnj, roundNumber, clientType, special)
+	pnj:SetAttribute("OrderCount", #expanded)
 	pnj:SetAttribute("ServedCount", 0)
-	-- attributes cannot store a Lua table so the item list is joined into one string
-	pnj:SetAttribute("Order", table.concat(orderExpanded, ";"))
-
-	-- normal patience depends on the order while mysterious customers use a fixed timeout
-	local patience = clientType == "mysterious" and S.MYSTERIOUS_TIMEOUT
-		or OH.computePatienceForOrder(orderExpanded, roundNum) * (clientType == "inspector" and S.INSPECTOR_PATIENCE_MULT or 1)
+	-- attributes cannot hold tables so the shared order uses a separated string
+	pnj:SetAttribute("Order", table.concat(expanded, ";"))
+	local patience = S.MYSTERIOUS_TIMEOUT
+	if clientType ~= "mysterious" then
+		patience = OH.computePatienceForOrder(expanded, roundNumber)
+		if clientType == "inspector" then
+			patience *= S.INSPECTOR_PATIENCE_MULT
+		end
+	end
 	pnj:SetAttribute("PatienceMax", patience)
 	pnj:SetAttribute("Patience", patience)
 	pnj:SetAttribute("IsCustomer", true)
-
-	local head = pnj:FindFirstChild("Head")
-	if head then
-		local bb = head:FindFirstChildWhichIsA("BillboardGui")
-		if not bb then
-			bb = ServerStorage.BillboardGuiTemplate:Clone()
-			bb.Parent = head
-		end
-		bb.Adornee = head
-		bb.MaxDistance = 50
-		-- show the order only after the customer reaches the serving spot
-		bb.Enabled = false
-		local frame = bb:FindFirstChild("Frame")
-		if frame then
-			if clientType ~= "normal" then
-				applyTypeToBillboard(frame, clientType)
-			end
-
-			local ic = frame:FindFirstChild("ItemContainer")
-			if ic then
-				for _, c in ipairs(ic:GetChildren()) do c:Destroy() end
-
-				if clientType == "mysterious" then
-					local img = Instance.new("ImageLabel")
-					img.Size = UDim2.new(0.5,0,0.85,0)
-					img.Position = UDim2.new(0.5,0,0,0)
-					img.AnchorPoint = Vector2.new(0.5,0)
-					img.BackgroundTransparency = 1
-					img.Image = "rbxassetid://133644464181177"
-					img.Parent = ic
-				else
-					local distinctCount = 0
-					-- pairs counts dictionary entries while the length operator is meant for array sequences
-					for _ in pairs(orderCounts) do distinctCount += 1 end
-					pnj:SetAttribute("DistinctItemCount", distinctCount)
-
-					local function positionForIndex(i)
-						if distinctCount == 1 then
-							return UDim2.new(0.5, 0, 0, 0), Vector2.new(0.5, 0)
-						elseif distinctCount == 2 then
-							local pos = ({0.25, 0.75})[i] or 0.5
-							return UDim2.new(pos, 0, 0, 0), Vector2.new(0.5, 0)
-						else
-							return UDim2.new(0, (i - 1) * 52, 0, 0), Vector2.new(0, 0)
-						end
-					end
-
-					-- sort item names so the icons keep a consistent order
-					local keys = {}
-					for n in pairs(orderCounts) do table.insert(keys, n) end
-					table.sort(keys)
-
-					for i, name in ipairs(keys) do
-						local count = orderCounts[name]
-						local need = Instance.new("IntValue")
-						-- store a separate quantity for each food type so repeated items share one counter
-						need.Name = "Need_" .. name
-						need.Value = count
-						need.Parent = pnj
-
-						local img = Instance.new("ImageLabel")
-						img.Name = "Item_" .. name
-						img.Size = UDim2.new(0.5, 0, 0.85, 0)
-						img.BackgroundTransparency = 1
-						local pos, anchor = positionForIndex(i)
-						img.Position = pos
-						img.AnchorPoint = anchor
-						local itemData = ItemsModule.GetData(name)
-						img.Image = (itemData and itemData.Image) or ""
-						img.Parent = ic
-
-						local qty = ServerStorage.TextLabel:Clone()
-						qty.Name = "Qty"
-						qty.Text = "x" .. tostring(count)
-						-- only show a quantity label when the order needs more than one of this item
-						qty.Visible = (count or 1) > 1
-						qty.Parent = img
-					end
-				end
-			end
-
-			local bar = frame:FindFirstChild("PatienceBar")
-			if bar then
-				if bar:FindFirstChild("Fill") then bar.Fill.Size = UDim2.new(0.97,0,0.7,0) end
-				local mid = bar:FindFirstChild("MidIndicator")
-				if mid then
-					mid.Visible = S.currentRoundType == "streak"
-						and clientType ~= "mysterious"
-						and clientType ~= "inspector"
-				end
-			end
-		end
-	end
-
 	pnj:SetAttribute("PartialBonusApplied", false)
-	S.activePNJ[pnj] = true
-	S.aliveThisRound += 1
+	return counts
+end
 
-	-- release reservations if the customer is removed before normal cleanup
-	pnj.AncestryChanged:Connect(function(_, parent)
-		-- the active set guard avoids counting a removal again after finalizePNJ already handled it
-		if parent == nil and S.activePNJ[pnj] then
-			S.activePNJ[pnj] = nil
-			S.aliveThisRound = math.max(0, S.aliveThisRound - 1)
-			if pnj:GetAttribute("HasArrivalTicket") then
-				releaseTicket()
-				pnj:SetAttribute("HasArrivalTicket", nil)
-			end
-			local df = workspace:FindFirstChild("DepartSpots")
-			local af = workspace:FindFirstChild("ArrivePNJ")
-			if df then freeSpot(S.occupiedDepartSpots, pnj:GetAttribute("DepartSpot"), df) end
-			if af then freeSpot(S.occupiedArriveSpots, pnj:GetAttribute("AssignedSpot"), af) end
-		end
-	end)
-
-	local walkAnimId = opts.special and 10921152678 or 913402848
-
-	if humanoid then
-		local ok = moveTo(humanoid, passagePart.Position, walkAnimId, 8)
-		-- move a stuck customer to the passage so it can continue to the queue
-		if not ok then
-			local root = pnj.PrimaryPart or pnj:FindFirstChild("HumanoidRootPart")
-			if root then
-				local y = passagePart.Position.Y + humanoid.HipHeight + (root.Size.Y * 0.5)
-				pnj:SetPrimaryPartCFrame(CFrame.lookAt(
-					Vector3.new(passagePart.Position.X, y, passagePart.Position.Z),
-					Vector3.new(passagePart.Position.X, y, passagePart.Position.Z) + passagePart.CFrame.LookVector,
-					Vector3.new(0,1,0)
-					))
-			end
-		end
+local function positionForIndex(index, count)
+	if count == 1 then
+		return UDim2.fromScale(0.5, 0), Vector2.new(0.5, 0)
 	end
+	if count == 2 then
+		return UDim2.fromScale(index == 1 and 0.25 or 0.75, 0), Vector2.new(0.5, 0)
+	end
+	return UDim2.fromOffset((index - 1) * 52, 0), Vector2.zero
+end
 
-	freeSpot(S.occupiedDepartSpots, departSpot.Name, departFolder)
+local function createOrderIcon(container, name, index, count)
+	local image = Instance.new("ImageLabel")
+	image.Name = "Item_" .. name
+	image.Size = UDim2.fromScale(0.5, 0.85)
+	image.BackgroundTransparency = 1
+	image.Position, image.AnchorPoint = positionForIndex(index, count)
+	local data = ItemsModule.GetData(name)
+	image.Image = data and data.Image or ""
+	image.Parent = container
+	return image
+end
 
-	-- the arrival quota is separate from the number of physical serving spots
-	while S.arrivalTicketsInUse >= S.arrivalQuota do
-		if not S.isRoundRunning or S.stopCurrentSpawn or S.lives <= 0 then
-			if pnj and pnj.Parent then PS.finalizePNJ(pnj, "gameover") end
-			return nil
+local function fillOrderIcons(pnj, container, counts, clientType)
+	container:ClearAllChildren()
+	if clientType == "mysterious" then
+		local image = Instance.new("ImageLabel")
+		image.Size = UDim2.fromScale(0.5, 0.85)
+		image.Position = UDim2.fromScale(0.5, 0)
+		image.AnchorPoint = Vector2.new(0.5, 0)
+		image.BackgroundTransparency = 1
+		image.Image = "rbxassetid://133644464181177"
+		image.Parent = container
+		return
+	end
+	local names = {}
+	for name in counts do
+		table.insert(names, name)
+	end
+	-- sorting dictionary keys keeps the icon order stable between customers
+	table.sort(names)
+	pnj:SetAttribute("DistinctItemCount", #names)
+	for index, name in names do
+		local need = Instance.new("IntValue")
+		need.Name = "Need_" .. name
+		need.Value = counts[name]
+		need.Parent = pnj
+		local image = createOrderIcon(container, name, index, #names)
+		local quantity = ServerStorage.TextLabel:Clone()
+		quantity.Name = "Qty"
+		quantity.Text = "x" .. tostring(counts[name])
+		quantity.Visible = counts[name] > 1
+		quantity.Parent = image
+	end
+end
+
+local function prepareBillboard(pnj, context, counts, clientType)
+	local head = pnj:FindFirstChild("Head")
+	if not head then
+		return
+	end
+	context.head = head
+	local billboard = head:FindFirstChildWhichIsA("BillboardGui")
+	if not billboard then
+		billboard = ServerStorage.BillboardGuiTemplate:Clone()
+		billboard.Parent = head
+	end
+	context.billboard = billboard
+	billboard.Adornee = head
+	billboard.MaxDistance = 50
+	billboard.Enabled = false
+	local frame = billboard:FindFirstChild("Frame")
+	if not frame then
+		return
+	end
+	applyTypeToBillboard(frame, clientType)
+	local container = frame:FindFirstChild("ItemContainer")
+	if container then
+		fillOrderIcons(pnj, container, counts, clientType)
+	end
+	local bar = frame:FindFirstChild("PatienceBar")
+	if not bar then
+		return
+	end
+	context.fill = bar:FindFirstChild("Fill")
+	if context.fill then
+		context.fill.Size = UDim2.fromScale(0.97, 0.7)
+	end
+	local marker = bar:FindFirstChild("MidIndicator")
+	if marker then
+		marker.Visible = S.currentRoundType == "streak"
+			and clientType ~= "mysterious" and clientType ~= "inspector"
+	end
+end
+
+local function updatePatienceBar(context, ratio)
+	local fill = context.fill
+	if not fill or not fill.Parent then
+		return
+	end
+	-- keep one tween per customer instead of separate size and color tweens
+	if context.barTween then
+		context.barTween:Cancel()
+		context.barTween:Destroy()
+	end
+	context.barTween = TweenService:Create(fill, BAR_TWEEN, {
+		Size = UDim2.fromScale(ratio, 0.7),
+		BackgroundColor3 = getPatienceColor(ratio),
+	})
+	context.barTween:Play()
+end
+
+local function updateStreak(pnj, ratio, clientType)
+	if ratio > 0.5 or pnj:GetAttribute("PassedHalfway") then
+		return
+	end
+	if S.currentRoundType ~= "streak" or not S.streakData.boosted then
+		return
+	end
+	if clientType == "mysterious" or clientType == "inspector" then
+		return
+	end
+	pnj:SetAttribute("PassedHalfway", true)
+	S.streakData.boosted = false
+	S.streakData.count = 0
+	EM.removeStreakBoost(S.roundNumber)
+	S.REFolder.StreakUpdate:FireAllClients(0, S.STREAK_REQUIRED, false)
+end
+
+local function startWarning(pnj, context)
+	context.warningActive = true
+	pnj:SetAttribute("LowPatienceSignaled", true)
+	local vfx = ServerStorage:FindFirstChild(S.LOW_PATIENCE_VFX_NAME)
+	if vfx then
+		context.warningVFX = vfx:Clone()
+		context.warningVFX.Parent = context.head
+	end
+	local sound = ServerStorage:FindFirstChild(S.LOW_PATIENCE_SOUND_NAME)
+	if sound and sound:IsA("Sound") then
+		context.warningSound = sound:Clone()
+		context.warningSound.Parent = context.head
+		context.warningSound:Play()
+	end
+	context.warningTrack = loadTrack(context.humanoid, S.LOW_PATIENCE_ANIM_ID)
+	if context.warningTrack then
+		context.warningTrack.Looped = true
+		context.warningTrack:Play()
+	end
+end
+
+local function updateWarning(pnj, context, ratio, clientType)
+	if clientType == "mysterious" or not context.head or not context.head.Parent then
+		return
+	end
+	local isLow = ratio <= S.LOW_PATIENCE_THRESHOLD
+	if isLow == context.warningActive then
+		return
+	end
+	-- react only when crossing the threshold so the loop does not clone effects repeatedly
+	if isLow then
+		startWarning(pnj, context)
+		return
+	end
+	clearWarning(context)
+	pnj:SetAttribute("LowPatienceSignaled", false)
+end
+
+local function orderIsComplete(pnj, clientType)
+	if pnj:GetAttribute("OrderComplete") then
+		return true
+	end
+	-- an empty mysterious order must not count as a completed normal order
+	return clientType ~= "mysterious"
+		and (pnj:GetAttribute("ServedCount") or 0) >= (pnj:GetAttribute("OrderCount") or math.huge)
+end
+
+local function handleTimeout(pnj, clientType)
+	if orderIsComplete(pnj, clientType) then
+		return
+	end
+	if clientType == "mysterious" or clientType == "inspector" then
+		PS.finalizePNJ(pnj, "timeout")
+		return
+	end
+	S.lives = math.max(0, S.lives - 1)
+	S.REFolder.removelife:FireAllClients(S.lives)
+	S.REFolder.LifeChanged:FireAllClients(S.lives)
+	S.onBroadcastBuyLifeState()
+	PS.finalizePNJ(pnj, "timeout")
+	if S.lives <= 0 then
+		S.isRoundRunning = false
+		S.onGameOver()
+	end
+end
+
+local function runPatience(pnj, context, clientType)
+	local previousTime = os.clock()
+	while customerIsActive(pnj) and not pnj:GetAttribute("OrderComplete") do
+		if not roundIsRunning(context.roundNumber) then
+			PS.finalizePNJ(pnj, "roundended")
+			break
+		end
+		-- use elapsed time because a resumed task can run later than the requested wait
+		local now = os.clock()
+		local patience = (pnj:GetAttribute("Patience") or 0) - (now - previousTime)
+		previousTime = now
+		pnj:SetAttribute("Patience", patience)
+		local maximum = math.max(pnj:GetAttribute("PatienceMax") or 1, 0.001)
+		local ratio = math.clamp(patience / maximum, 0, 1)
+		updatePatienceBar(context, ratio)
+		updateStreak(pnj, ratio, clientType)
+		updateWarning(pnj, context, ratio, clientType)
+		if patience <= 0 then
+			handleTimeout(pnj, clientType)
+			break
+		end
+		task.wait(0.15)
+	end
+	clearWarning(context)
+end
+
+local function waitForSpot(folder, occupied, canContinue)
+	while canContinue() do
+		local spot = getFreeSpot(folder, occupied)
+		if spot then
+			return spot
+		end
+		task.wait(0.2)
+	end
+	return nil
+end
+
+local function claimArrival(pnj, canContinue)
+	while canContinue() do
+		if S.arrivalTicketsInUse < S.arrivalQuota then
+			-- claim without yielding after the check and record who must return the ticket
+			S.arrivalTicketsInUse += 1
+			pnj:SetAttribute("HasArrivalTicket", true)
+			return true
 		end
 		task.wait(0.1)
 	end
+	return false
+end
 
-	-- claim the ticket without yielding after the quota check
-	-- the attribute records ownership so cleanup knows whether this customer must return it
-	S.arrivalTicketsInUse += 1
-	pnj:SetAttribute("HasArrivalTicket", true)
-
-	-- keep the ticket while waiting for an actual serving spot
-	local arriveSpot
-	while not arriveSpot do
-		if not S.isRoundRunning or S.stopCurrentSpawn or S.lives <= 0 then
-			releaseTicket()
-			pnj:SetAttribute("HasArrivalTicket", nil)
-			if pnj and pnj.Parent then PS.finalizePNJ(pnj, "gameover") end
-			return nil
-		end
-		arriveSpot = getFreeSpot(arriveFolder, S.occupiedArriveSpots)
-		if not arriveSpot then task.wait(0.2) end
+local function prepareCustomer(pnj, context, departSpot, clientType, special)
+	if not special then
+		applyFriendSkin(pnj)
 	end
-
-	pnj:SetAttribute("AssignedSpot", arriveSpot.Name)
-
-	if humanoid then
-		moveTo(humanoid, arriveSpot.Position, walkAnimId, 8)
-		local root = pnj.PrimaryPart or pnj:FindFirstChild("HumanoidRootPart")
-		if root then
-			local y = arriveSpot.Position.Y + humanoid.HipHeight + (root.Size.Y * 0.5)
-			pnj:SetPrimaryPartCFrame(CFrame.lookAt(
-				Vector3.new(arriveSpot.Position.X, y, arriveSpot.Position.Z),
-				Vector3.new(arriveSpot.Position.X, y, arriveSpot.Position.Z) + arriveSpot.CFrame.LookVector,
-				Vector3.new(0,1,0)
-				))
-		end
-		local bb = head and head:FindFirstChildWhichIsA("BillboardGui")
-		if bb then bb.Enabled = true end
+	if not customerIsActive(pnj) or not roundIsRunning(context.roundNumber) then
+		return false
 	end
+	local humanoid = pnj:FindFirstChildOfClass("Humanoid")
+	local root = pnj:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		return false
+	end
+	context.humanoid = humanoid
+	pnj.PrimaryPart = root
+	preparePhysics(pnj)
+	-- assigning nil keeps physics on the server when the assembly supports ownership
+	local canSetOwnership = root:CanSetNetworkOwnership()
+	if canSetOwnership then
+		root:SetNetworkOwner(nil)
+	end
+	root.CanCollide = true
+	humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	local animate = ServerStorage:FindFirstChild("Animate")
+	if animate then
+		animate:Clone().Parent = pnj
+	end
+	placeOnSpot(pnj, departSpot, 0.05)
+	local counts = configureOrder(pnj, context.roundNumber, clientType, special)
+	prepareBillboard(pnj, context, counts, clientType)
+	return true
+end
 
-	task.spawn(function()
-		-- start patience after arrival so travel time does not count against the order
-		local start = tick()
-		local vfxT = ServerStorage:FindFirstChild(S.LOW_PATIENCE_VFX_NAME)
-		local sndT = ServerStorage:FindFirstChild(S.LOW_PATIENCE_SOUND_NAME)
-		local animInst = Instance.new("Animation")
-		animInst.AnimationId = "rbxassetid://" .. tostring(S.LOW_PATIENCE_ANIM_ID)
+local function arriveAtCounter(pnj, context, passage, arriveFolder, animationId)
+	local function canContinue()
+		return customerIsActive(pnj) and roundIsRunning(context.roundNumber)
+	end
+	local reached = moveTo(context.humanoid, passage.Position, animationId, 8, canContinue)
+	if not canContinue() then
+		return false
+	end
+	if not reached then
+		placeOnSpot(pnj, passage, 0)
+	end
+	freeSpot(pnj, "DepartSpot", "DepartSpots", S.occupiedDepartSpots)
+	if not claimArrival(pnj, canContinue) then
+		return false
+	end
+	local spot = waitForSpot(arriveFolder, S.occupiedArriveSpots, canContinue)
+	if not spot then
+		return false
+	end
+	pnj:SetAttribute("AssignedSpot", spot.Name)
+	moveTo(context.humanoid, spot.Position, animationId, 8, canContinue)
+	-- a round can end during movement so recheck before starting the order timer
+	if not canContinue() then
+		return false
+	end
+	placeOnSpot(pnj, spot, 0)
+	if context.billboard then
+		context.billboard.Enabled = true
+	end
+	return true
+end
 
-		local lowSignaled = false
-		local spawnedVFX, spawnedSound, spawnedTrack = nil, nil, nil
-
-		while pnj.Parent do
-			if pnj:GetAttribute("OrderComplete") or pnj:GetAttribute("Finalized") then break end
-
-			-- subtract actual elapsed time because task wait does not resume at an exact interval
-			local elapsed = tick() - start
-			start = tick()
-			-- read the current attribute each time so patience changes from other systems are preserved
-			local cur = (pnj:GetAttribute("Patience") or 0) - elapsed
-			pnj:SetAttribute("Patience", cur)
-
-			if head and head:FindFirstChildWhichIsA("BillboardGui") then
-				local bb = head:FindFirstChildWhichIsA("BillboardGui")
-				if bb and bb.Frame and bb.Frame:FindFirstChild("PatienceBar") and bb.Frame.PatienceBar:FindFirstChild("Fill") then
-					local maxP = pnj:GetAttribute("PatienceMax") or 1
-					-- clamp the display ratio so the bar cannot shrink below zero or overflow
-					local ratio = math.clamp(cur / maxP, 0, 1)
-					updatePatienceBar(bb.Frame.PatienceBar.Fill, ratio)
-					TweenService:Create(bb.Frame.PatienceBar.Fill, TweenInfo.new(0.1, Enum.EasingStyle.Linear), {
-						BackgroundColor3 = getPatienceColor(ratio)
-					}):Play()
-
-					-- an eligible customer passing halfway cancels the active streak boost
-					if ratio <= 0.5
-						and not pnj:GetAttribute("PassedHalfway")
-						and S.currentRoundType == "streak"
-						and S.streakData.boosted
-						and clientType ~= "mysterious"
-						and clientType ~= "inspector" then
-						-- remember this crossing on the customer so it cannot cancel a later boost a second time
-						pnj:SetAttribute("PassedHalfway", true)
-						S.streakData.boosted = false
-						S.streakData.count = 0
-						EM.removeStreakBoost(S.roundNumber)
-						S.REFolder.StreakUpdate:FireAllClients(0, S.STREAK_REQUIRED, false)
-					end
-
-					if clientType ~= "mysterious" then
-						-- trigger the warning once instead of cloning effects on every update
-						if ratio <= S.LOW_PATIENCE_THRESHOLD and not lowSignaled then
-							lowSignaled = true
-							pnj:SetAttribute("LowPatienceSignaled", true)
-							if vfxT then spawnedVFX = vfxT:Clone() spawnedVFX.Parent = head end
-							if sndT then
-								spawnedSound = sndT:Clone()
-								spawnedSound.Parent = head
-								pcall(function() spawnedSound:Play() end)
-							end
-							if humanoid then
-								local ok, track = pcall(function() return humanoid.Animator:LoadAnimation(animInst) end)
-								if ok and track then
-									spawnedTrack = track
-									spawnedTrack.Looped = true
-									spawnedTrack:Play()
-								end
-							end
-						end
-						-- clear the warning if patience goes back above the threshold
-						if ratio > S.LOW_PATIENCE_THRESHOLD and lowSignaled then
-							lowSignaled = false
-							pnj:SetAttribute("LowPatienceSignaled", false)
-							if spawnedTrack then pcall(function() spawnedTrack:Stop(); spawnedTrack:Destroy() end) spawnedTrack = nil end
-							if spawnedSound then pcall(function() spawnedSound:Stop(); spawnedSound:Destroy() end) spawnedSound = nil end
-							if spawnedVFX then pcall(function() spawnedVFX:Destroy() end) spawnedVFX = nil end
-						end
-					end
-				end
-			end
-
-			-- check completion again before applying a timeout penalty
-			if cur <= 0 then
-				local served = pnj:GetAttribute("ServedCount") or 0
-				local need = pnj:GetAttribute("OrderCount") or math.huge
-				if pnj:GetAttribute("OrderComplete") then break end
-				-- a mysterious customer has an empty order so zero served must not count as completion
-				if clientType ~= "mysterious" and served >= need then break end
-
-				if spawnedTrack then pcall(function() spawnedTrack:Stop(); spawnedTrack:Destroy() end) end
-				if spawnedSound then pcall(function() spawnedSound:Stop(); spawnedSound:Destroy() end) end
-				if spawnedVFX then pcall(function() spawnedVFX:Destroy() end) end
-
-				-- these two customer types leave on timeout without removing a life
-				if clientType == "mysterious" or clientType == "inspector" then
-					PS.finalizePNJ(pnj, "timeout")
-				else
-					S.lives -= 1
-					S.REFolder.removelife:FireAllClients(S.lives)
-					-- send the server value to every player so their life displays can stay in sync
-					S.REFolder.LifeChanged:FireAllClients(S.lives)
-					S.onBroadcastBuyLifeState()
-					PS.finalizePNJ(pnj, "timeout")
-					if S.lives <= 0 then
-						S.isRoundRunning = false
-						S.onGameOver()
-					end
-				end
-				break
-			end
-
-			-- yield between updates so this loop does not block the server
-			-- the elapsed time calculation accounts for any delay beyond this wait
-			task.wait(0.15)
+local function cloneCustomer(template)
+	local pnj = template:Clone()
+	-- remove the template animation controller before it can run as a player script
+	-- the shared npc controller is added after the appearance is ready
+	for _, child in pnj:GetChildren() do
+		if child.Name == "Animate" and child:IsA("LuaSourceContainer") then
+			child:Destroy()
 		end
+	end
+	return pnj
+end
 
-		if spawnedTrack then pcall(function() spawnedTrack:Stop(); spawnedTrack:Destroy() end) end
-		if spawnedSound then pcall(function() spawnedSound:Stop(); spawnedSound:Destroy() end) end
-		if spawnedVFX then pcall(function() spawnedVFX:Destroy() end) end
+function PS.spawnPNJForRound(roundNumber, opts)
+	opts = opts or {}
+	if not roundIsRunning(roundNumber) then
+		return nil
+	end
+	local departFolder = workspace:FindFirstChild("DepartSpots")
+	local arriveFolder = workspace:FindFirstChild("ArrivePNJ")
+	local passage = workspace:FindFirstChild("PassagePNJ")
+	local template = ServerStorage:FindFirstChild(opts.special and "SpecialClientRig" or "TemplatePNJ")
+	if not departFolder or not arriveFolder or not passage or not template then
+		warn("PNJ spawn is missing a required map object or template")
+		return nil
+	end
+	local departSpot = waitForSpot(departFolder, S.occupiedDepartSpots, function()
+		return roundIsRunning(roundNumber)
 	end)
-
+	if not departSpot then
+		return nil
+	end
+	local clientType = opts.special and "special" or CT.pickClientType()
+	local pnj = cloneCustomer(template)
+	pnj.Name = (opts.special and "VIP_R" or "PNJ_R") .. roundNumber
+	pnj:SetAttribute("ClientType", clientType)
+	pnj:SetAttribute("DepartSpot", departSpot.Name)
+	pnj.Parent = workspace
+	local context = registerCustomer(pnj, roundNumber)
+	if clientType == "vacationer" then
+		S.vacationersRemaining = math.max(0, S.vacationersRemaining - 1)
+	end
+	local ok, prepared = pcall(prepareCustomer, pnj, context, departSpot, clientType, opts.special)
+	if not ok or not prepared then
+		if not ok then
+			warn("PNJ setup failed", prepared)
+		end
+		PS.finalizePNJ(pnj, "cancelled")
+		return nil
+	end
+	local vipSound = opts.special and workspace:FindFirstChild("vip")
+	if vipSound and vipSound:IsA("Sound") then
+		vipSound:Play()
+	end
+	local animationId = opts.special and SPECIAL_WALK_ANIMATION or WALK_ANIMATION
+	if not arriveAtCounter(pnj, context, passage, arriveFolder, animationId) then
+		PS.finalizePNJ(pnj, "cancelled")
+		return nil
+	end
+	-- only start patience at the counter so time spent walking does not punish the player
+	task.spawn(runPatience, pnj, context, clientType)
 	return pnj
 end
 
